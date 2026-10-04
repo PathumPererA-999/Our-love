@@ -450,6 +450,10 @@
       <button class="btn btn-primary" id="saveMemory">Save Memory</button>
     </div>
 
+    <!-- NEW: Import Backup -->
+    <input type="file" id="importFile" accept=".json" style="display:none">
+    <button class="btn btn-secondary" style="width:100%;margin-top:10px" onclick="document.getElementById('importFile').click()">Import Backup</button>
+
     <div class="existing-list">
       <h3>Existing Memories</h3>
       <div id="memList"></div>
@@ -501,7 +505,7 @@ firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
 
 /* ============================================================
-   DATA & LOCAL STORAGE
+   DATA & SYNC (memories are now shared through Firebase)
 ============================================================ */
 const RELATIONSHIP_START = "2026-08-19"; // <--- CHANGE THIS DATE!
 
@@ -558,15 +562,86 @@ let currentRoom = null;
 let userId = null;
 let userName = 'Me';
 let lastPartnerLoc = null;
+let localAtStart = {};
+
+// Firebase drops empty arrays, so make sure every memory is complete
+function normalize(obj) {
+  const out = {};
+  Object.keys(obj || {}).forEach(k => {
+    const m = obj[k] || {};
+    out[k] = {
+      title: m.title || '',
+      memory: m.memory || '',
+      photos: Array.isArray(m.photos) ? m.photos : Object.values(m.photos || {})
+    };
+  });
+  return out;
+}
+
+// Saves a copy on this phone (works as a quick cache)
+function saveData() {
+  try {
+    localStorage.setItem('loveCalendarMemories', JSON.stringify(MEMORIES));
+  } catch (e) {
+    console.warn('Local cache full, using Firebase only');
+  }
+}
+
+let refreshTimer = null;
+function refreshUI() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => {
+    saveData();
+    render();
+    if (document.getElementById('editorModal').classList.contains('open')) renderMemList();
+  }, 150);
+}
+
+function pushMemory(k) {
+  db.ref('memories/' + k).set(MEMORIES[k]).catch(err => {
+    alert('Could not save to Firebase: ' + err.message);
+  });
+}
 
 function loadData() {
-  const saved = localStorage.getItem('loveCalendarMemories');
-  if (saved) {
-    MEMORIES = JSON.parse(saved);
-  } else {
-    MEMORIES = { ...DEFAULT_MEMORIES };
-    saveData();
-  }
+  // Show this phone's saved copy instantly
+  try {
+    const saved = localStorage.getItem('loveCalendarMemories');
+    if (saved) {
+      localAtStart = normalize(JSON.parse(saved));
+      MEMORIES = JSON.parse(JSON.stringify(localAtStart));
+    }
+  } catch (e) {}
+
+  // Live sync with Firebase (both phones see the same memories)
+  db.ref('memories').on('value', (snap) => {
+    const cloud = normalize(snap.val());
+
+    // One time per phone: upload what is already saved on this phone
+    if (!localStorage.getItem('memMigrated')) {
+      localStorage.setItem('memMigrated', '1');
+      let pushed = false;
+      Object.keys(localAtStart).forEach(k => {
+        const c = cloud[k];
+        const l = localAtStart[k];
+        if (!c || l.photos.length > c.photos.length) {
+          db.ref('memories/' + k).set(l);
+          pushed = true;
+        }
+      });
+      if (!pushed && Object.keys(cloud).length === 0) {
+        const defs = normalize(DEFAULT_MEMORIES);
+        Object.keys(defs).forEach(k => db.ref('memories/' + k).set(defs[k]));
+        pushed = true;
+      }
+      if (pushed) return; // Firebase will fire again with the merged data
+    }
+
+    MEMORIES = cloud;
+    refreshUI();
+  }, (err) => {
+    alert('Could not reach Firebase: ' + err.message);
+  });
   
   const savedRoom = localStorage.getItem('currentRoom');
   if (savedRoom) {
@@ -575,14 +650,6 @@ function loadData() {
     userId = roomData.userId;
     userName = roomData.userName || 'Me';
     startLocationTracking();
-  }
-}
-
-function saveData() {
-  try {
-    localStorage.setItem('loveCalendarMemories', JSON.stringify(MEMORIES));
-  } catch (e) {
-    alert("Storage full! Try deleting some older photos to add new ones.");
   }
 }
 
@@ -671,7 +738,7 @@ document.getElementById('openEditor').onclick = () => {
   document.getElementById('editorModal').classList.add('open');
 };
 
-function compressImage(file, maxWidth = 800, quality = 0.7) {
+function compressImage(file, maxWidth = 700, quality = 0.6) {
   return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -730,6 +797,7 @@ document.getElementById('saveMemory').onclick = () => {
   }
 
   saveData();
+  pushMemory(dateVal);   // <-- shares it with your girlfriend's phone
   render();
   renderMemList();
   
@@ -769,6 +837,7 @@ function renderMemList() {
       if(confirm(`Delete "${m.title}"? This cannot be undone.`)) {
         delete MEMORIES[k];
         saveData();
+        db.ref('memories/' + k).remove();   // <-- removes it for both phones
         render();
         renderMemList();
       }
@@ -786,6 +855,24 @@ function exportData() {
   downloadAnchorNode.click();
   downloadAnchorNode.remove();
 }
+
+// NEW: Import a backup file into Firebase
+document.getElementById('importFile').onchange = (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      const data = normalize(JSON.parse(r.result));
+      Object.keys(data).forEach(k => db.ref('memories/' + k).set(data[k]));
+      alert('Imported ' + Object.keys(data).length + ' memories 💕');
+    } catch (err) {
+      alert('Invalid backup file');
+    }
+  };
+  r.readAsText(f);
+  e.target.value = '';
+};
 
 /* ============================================================
    MAP & REAL-TIME LOCATION FEATURES
