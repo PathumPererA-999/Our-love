@@ -647,7 +647,7 @@ function loadData() {
   if (savedRoom) {
     const roomData = JSON.parse(savedRoom);
     currentRoom = roomData.room;
-    userId = roomData.userId;
+    userId = getDeviceId();
     userName = roomData.userName || 'Me';
     startLocationTracking();
   }
@@ -897,12 +897,14 @@ function createHeartIcon(color, label) {
   });
 }
 
+let lastFitCount = 0;
 function updateMap(myLoc, partnerLoc) {
   if (!map) return;
   
   if (myMarker) map.removeLayer(myMarker);
   if (partnerMarker) map.removeLayer(partnerMarker);
   if (distanceLine) map.removeLayer(distanceLine);
+  myMarker = partnerMarker = distanceLine = null;
   
   const locations = [];
   
@@ -928,11 +930,14 @@ function updateMap(myLoc, partnerLoc) {
       dashArray: '10, 10'
     }).addTo(map);
     
-    map.fitBounds(locations, { padding: [50, 50] });
+    // Only re-zoom when someone just appeared (not on every GPS update)
+    if (lastFitCount !== 2) map.fitBounds(locations, { padding: [50, 50] });
     calculateDistance(myLoc, partnerLoc);
-  } else if (locations.length === 1) {
-    map.setView(locations[0], 13);
+  } else {
+    calculateDistance(null, null);
+    if (locations.length === 1 && lastFitCount !== 1) map.setView(locations[0], 13);
   }
+  lastFitCount = locations.length;
   
   updateLocationInfo(myLoc, partnerLoc);
 }
@@ -1004,8 +1009,9 @@ document.getElementById('joinRoomBtn').onclick = () => {
     return;
   }
   
+  stopTracking(true);
   currentRoom = roomCode;
-  userId = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+  userId = getDeviceId();
   userName = name;
   
   localStorage.setItem('currentRoom', JSON.stringify({
@@ -1037,66 +1043,179 @@ document.getElementById('shareRoomCode').onclick = () => {
   }
 };
 
-function startLocationTracking() {
+// One permanent ID per phone (so rejoining never creates a "ghost" you)
+function getDeviceId() {
+  let id = localStorage.getItem('deviceId');
+  if (!id) {
+    id = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    localStorage.setItem('deviceId', id);
+  }
+  return id;
+}
+
+const STALE_MS = 3 * 60 * 1000;   // partner counts as offline after 3 min of silence
+let partnerRef = null, partnerListener = null;
+let tickTimer = null, retryTimer = null;
+let myLastLoc = null, roomUsers = {}, trackingRoom = null;
+
+function evalPartner() {
+  let best = null;
+  Object.keys(roomUsers).forEach(id => {
+    if (id === userId) return;
+    const u = roomUsers[id];
+    if (!u || !u.timestamp || Date.now() - u.timestamp > STALE_MS) return;
+    if (!best || u.timestamp > best.timestamp) best = u;
+  });
+  lastPartnerLoc = best;
+  updateMap(myLastLoc, best);
+}
+
+// Stop sharing MY location (partner will see me as offline)
+function stopSharing() {
+  if (watchId !== null) {
+    navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+  }
+  clearTimeout(retryTimer);
+  myLastLoc = null;
+  if (trackingRoom && userId) {
+    db.ref(`rooms/${trackingRoom}/users/${userId}`).remove();
+  }
+}
+
+// Stop everything (leaving room / closing page)
+function stopTracking(removeRecord) {
+  if (watchId !== null) {
+    navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+  }
+  clearTimeout(retryTimer);
+  clearInterval(tickTimer);
+  tickTimer = null;
+  if (partnerRef && partnerListener) partnerRef.off('value', partnerListener);
+  partnerRef = null;
+  partnerListener = null;
+  if (removeRecord && trackingRoom && userId) {
+    db.ref(`rooms/${trackingRoom}/users/${userId}`).remove();
+  }
+  myLastLoc = null;
+  lastPartnerLoc = null;
+  roomUsers = {};
+}
+
+function showLocationProblem(msg) {
+  document.getElementById('locationInfo').innerHTML =
+    `⚠️ ${msg}<br><button class="loc-btn loc-btn-primary" style="margin-top:10px" onclick="beginWatch()">📍 Retry location</button>`;
+}
+
+function beginWatch() {
+  if (!currentRoom || watchId !== null) return;
   if (!navigator.geolocation) {
     alert('Geolocation is not supported by your browser');
     return;
   }
   
-  const info = document.getElementById('locationInfo');
-  info.innerHTML = '<span class="status-indicator status-online"></span>Getting your location...';
+  document.getElementById('locationInfo').innerHTML =
+    '<span class="status-indicator status-online"></span>Getting your location...';
   
-  // Watch position for real-time updates
   watchId = navigator.geolocation.watchPosition(
     (position) => {
-      const myLoc = {
+      myLastLoc = {
         lat: position.coords.latitude,
         lng: position.coords.longitude,
         name: userName,
         timestamp: Date.now()
       };
-      
-      // Update Firebase
-      db.ref(`rooms/${currentRoom}/users/${userId}`).set(myLoc);
-      
-      updateMap(myLoc, lastPartnerLoc);
+      const myRef = db.ref(`rooms/${currentRoom}/users/${userId}`);
+      myRef.set(myLastLoc);
+      myRef.onDisconnect().remove();   // auto-remove if the phone loses connection
+      updateMap(myLastLoc, lastPartnerLoc);
     },
     (error) => {
       console.error('Geolocation error:', error);
-      info.innerHTML = '⚠️ Unable to get location. Please enable location services.';
+      if (error.code === 1) {
+        // Location permission is off: stop and wait for it to be turned on again
+        stopSharing();
+        updateMap(null, lastPartnerLoc);
+        showLocationProblem('Location is turned off. Turn it on, then tap Retry (it will also resume automatically).');
+      } else {
+        // GPS temporarily unavailable: restart the watcher after a few seconds
+        showLocationProblem('Waiting for GPS signal...');
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          if (watchId !== null) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+          }
+          beginWatch();
+        }, 10000);
+      }
     },
     {
       enableHighAccuracy: true,
-      timeout: 10000,
-      maximumAge: 0
+      timeout: 20000,
+      maximumAge: 5000
     }
   );
-  
-  // Listen for partner's location
-  db.ref(`rooms/${currentRoom}/users`).on('value', (snapshot) => {
-    const users = snapshot.val();
-    if (!users) return;
-    
-    const userIds = Object.keys(users);
-    const partnerId = userIds.find(id => id !== userId);
-    
-    if (partnerId && users[partnerId]) {
-      lastPartnerLoc = users[partnerId];
-      const myLoc = users[userId];
-      updateMap(myLoc, lastPartnerLoc);
-    }
-  });
 }
 
-// Clean up when leaving page
-window.addEventListener('beforeunload', () => {
-  if (watchId) {
-    navigator.geolocation.clearWatch(watchId);
-  }
-  if (currentRoom && userId) {
-    db.ref(`rooms/${currentRoom}/users/${userId}`).remove();
-  }
+function startLocationTracking() {
+  if (!currentRoom) return;
+  
+  stopTracking(false);          // never run two watchers / two listeners
+  trackingRoom = currentRoom;
+  
+  // Remove old ghost entries (older than 1 hour) from this room
+  db.ref(`rooms/${currentRoom}/users`).once('value', (snap) => {
+    const users = snap.val() || {};
+    Object.keys(users).forEach(id => {
+      if (id !== userId && Date.now() - ((users[id] && users[id].timestamp) || 0) > 60 * 60 * 1000) {
+        db.ref(`rooms/${trackingRoom}/users/${id}`).remove();
+      }
+    });
+  });
+  
+  // Listen for partner's location
+  partnerRef = db.ref(`rooms/${currentRoom}/users`);
+  partnerListener = (snapshot) => {
+    roomUsers = snapshot.val() || {};
+    evalPartner();
+  };
+  partnerRef.on('value', partnerListener);
+  
+  // Every 45s: refresh my timestamp (so I don't look offline when standing still)
+  // and re-check whether the partner has gone quiet
+  clearInterval(tickTimer);
+  tickTimer = setInterval(() => {
+    if (myLastLoc && watchId !== null) {
+      myLastLoc.timestamp = Date.now();
+      db.ref(`rooms/${currentRoom}/users/${userId}`).set(myLastLoc);
+    }
+    evalPartner();
+  }, 45000);
+  
+  beginWatch();
+}
+
+// Resume automatically when location permission is switched back on,
+// when you return to the page, or when the internet comes back
+if (navigator.permissions && navigator.permissions.query) {
+  navigator.permissions.query({ name: 'geolocation' }).then((p) => {
+    p.onchange = () => {
+      if (p.state === 'granted' && currentRoom && watchId === null) beginWatch();
+    };
+  }).catch(() => {});
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && currentRoom && watchId === null) beginWatch();
 });
+window.addEventListener('online', () => {
+  if (currentRoom && watchId === null) beginWatch();
+});
+
+// Clean up when leaving page
+window.addEventListener('beforeunload', () => stopTracking(true));
+window.addEventListener('pagehide', () => stopTracking(true));
 
 /* ============================================================
    INITIALIZATION
